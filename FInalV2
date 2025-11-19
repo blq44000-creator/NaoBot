@@ -1,0 +1,717 @@
+import SwiftUI
+import CoreLocation
+import Combine
+
+// ============================================================================
+// MARK: - 1. CONFIGURATION & DESIGN SYSTEM
+// ============================================================================
+
+let GEMINI_API_KEY = "" // 🔴 COLLEZ VOTRE CLÉ ICI
+
+extension Color {
+    static let tanGreen = Color(red: 132/255, green: 195/255, blue: 66/255)
+    static let liquidDark = Color(red: 0.05, green: 0.07, blue: 0.15)
+}
+
+// Modificateur "Liquid Glass" (Version Native SwiftUI iOS 15+)
+// Plus de hack UIKit, on utilise le matériau natif.
+struct LiquidCapsuleStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding()
+            .background(.ultraThinMaterial) // Flou natif
+            .background(Color.white.opacity(0.05)) // Légère teinte
+            .cornerRadius(40)
+            .shadow(color: Color.black.opacity(0.2), radius: 10, x: 0, y: 5)
+            .overlay(
+                RoundedRectangle(cornerRadius: 40)
+                    .stroke(
+                        LinearGradient(
+                            colors: [.white.opacity(0.4), .white.opacity(0.1)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            )
+    }
+}
+
+struct LiquidBackground: View {
+    @State private var move = false
+    
+    var body: some View {
+        ZStack {
+            Color.liquidDark.ignoresSafeArea()
+            
+            // Orbes d'ambiance
+            Circle()
+                .fill(Color.tanGreen.opacity(0.3))
+                .frame(width: 300, height: 300)
+                .blur(radius: 80)
+                .offset(x: move ? -100 : 100, y: move ? -250 : -350)
+                .animation(Animation.easeInOut(duration: 10).repeatForever(autoreverses: true), value: move)
+            
+            Circle()
+                .fill(Color.blue.opacity(0.25))
+                .frame(width: 400, height: 400)
+                .blur(radius: 100)
+                .offset(x: move ? 150 : -50, y: move ? 300 : 100)
+                .animation(Animation.easeInOut(duration: 15).repeatForever(autoreverses: true), value: move)
+        }
+        .onAppear { move.toggle() }
+        .ignoresSafeArea()
+    }
+}
+
+// ============================================================================
+// MARK: - 2. MODÈLES (Compatibles Swift 5 & 6)
+// ============================================================================
+
+struct Arret: Identifiable, Hashable {
+    let id = UUID()
+    let codeLieu: String
+    let libelle: String
+    let latitude: Double
+    let longitude: Double
+    var distance: String? = nil
+    
+    static func == (lhs: Arret, rhs: Arret) -> Bool { lhs.codeLieu == rhs.codeLieu }
+    func hash(into hasher: inout Hasher) { hasher.combine(codeLieu) }
+}
+
+struct LignePassage: Identifiable, Hashable {
+    let id = UUID()
+    let numLigne: String
+    let terminus: String
+    let tempsAffiche: String
+    let sens: Int
+    let isRealTime: Bool
+}
+
+struct HorairePassage: Identifiable, Hashable {
+    let id = UUID()
+    let heure: String
+    let isRealTime: Bool
+    let isPast: Bool
+}
+
+struct TempsAttente: Codable, Identifiable {
+    let id = UUID() // Pas besoin de 'var' si on l'initialise manuellement
+    let sens: Int
+    let terminus: String
+    let temps: String
+    let ligne: LigneAPI?
+    
+    var isRealTime: Bool { temps == "Proche" || temps.contains("mn") }
+    
+    private enum CodingKeys: String, CodingKey {
+        case sens, terminus, temps, ligne
+    }
+    
+    // Init manuel pour contourner les bugs de Codable avec UUID
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.sens = try container.decode(Int.self, forKey: .sens)
+        self.terminus = try container.decode(String.self, forKey: .terminus)
+        self.temps = try container.decode(String.self, forKey: .temps)
+        self.ligne = try container.decodeIfPresent(LigneAPI.self, forKey: .ligne)
+        // id est généré automatiquement
+    }
+}
+
+struct LigneAPI: Codable {
+    let numLigne: String
+}
+
+struct TrafficInfo: Identifiable {
+    let id = UUID()
+    let titre: String
+    let message: String
+    let ligne: String?
+}
+
+// On retire @MainActor ou Sendable pour éviter les conflits de version
+@preconcurrency nonisolated struct TrafficResponseV2: Codable {
+    let results: [TrafficRecordV2]
+}
+
+@preconcurrency nonisolated struct TrafficRecordV2: Codable {
+    let intitule: String?
+    let libelle: String?
+    let resume: String?
+    let description: String?
+    let nature: String?
+    let type: String?
+    let ligne: [TrafficLineV2]?
+}
+
+@preconcurrency nonisolated struct TrafficLineV2: Codable {
+    let num_ligne: String?
+}
+
+// ============================================================================
+// MARK: - 3. GESTIONNAIRE (Mode Classique - Sans Actor Strict)
+// ============================================================================
+
+// On retire @MainActor sur la classe pour gérer les threads manuellement
+class TransportManager: NSObject, ObservableObject, CLLocationManagerDelegate {
+    @Published var locationStatus: String = "Recherche..."
+    @Published var allStops: [Arret] = []
+    @Published var nearbyStops: [Arret] = []
+    @Published var searchRadius: Double = 400
+    
+    @Published var waitTimes: [TempsAttente] = []
+    @Published var lineSchedule: [HorairePassage] = []
+    @Published var trafficInfos: [TrafficInfo] = []
+    @Published var userLocation: CLLocation?
+    @Published var isLoading: Bool = false
+    @Published var databaseLoaded: Bool = false
+
+    private let locationManager = CLLocationManager()
+    
+    override init() {
+        super.init()
+        
+        loadGTFSData()
+        
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        locationManager.distanceFilter = 50
+        locationManager.requestWhenInUseAuthorization()
+        locationManager.startUpdatingLocation()
+        
+        fetchTraffic()
+    }
+    
+    // --- GTFS ---
+    func loadGTFSData() {
+        print("📂 Chargement stops.txt...")
+        guard let path = Bundle.main.path(forResource: "stops", ofType: "txt") else {
+            print("❌ ERREUR : stops.txt manquant")
+            return
+        }
+        
+        // Tâche de fond standard
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let content = try String(contentsOfFile: path, encoding: .utf8)
+                let lines = content.components(separatedBy: .newlines)
+                var uniqueStops = [String: Arret]()
+                
+                for (i, line) in lines.enumerated() {
+                    if i == 0 || line.isEmpty { continue }
+                    
+                    let parts = self.parseCSVLine(line)
+                    if parts.count >= 5,
+                       let lat = Double(parts[3]),
+                       let lon = Double(parts[4]) {
+                        
+                        let id = parts[0].replacingOccurrences(of: "\"", with: "")
+                        let name = parts[1].replacingOccurrences(of: "\"", with: "")
+                        
+                        if uniqueStops[name] == nil {
+                            uniqueStops[name] = Arret(codeLieu: id, libelle: name, latitude: lat, longitude: lon)
+                        }
+                    }
+                }
+                
+                let sorted = Array(uniqueStops.values).sorted { $0.libelle < $1.libelle }
+                
+                // Retour Main Thread
+                DispatchQueue.main.async {
+                    self.allStops = sorted
+                    self.databaseLoaded = true
+                    print("✅ GTFS : \(self.allStops.count) arrêts.")
+                    self.refreshNearby()
+                }
+            } catch { print("Erreur lecture: \(error)") }
+        }
+    }
+    
+    private func parseCSVLine(_ line: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var insideQuotes = false
+        for char in line {
+            if char == "\"" { insideQuotes.toggle() }
+            else if char == "," && !insideQuotes {
+                result.append(current)
+                current = ""
+            } else { current.append(char) }
+        }
+        result.append(current)
+        return result
+    }
+    
+    // --- GPS ---
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let loc = locations.last else { return }
+        self.userLocation = loc
+        self.locationStatus = "GPS Actif"
+        self.refreshNearby()
+    }
+    
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        self.locationStatus = "Inactif"
+    }
+    
+    func toggleRadius() {
+        self.searchRadius = (self.searchRadius > 400) ? 400 : 1500
+        self.refreshNearby()
+    }
+    
+    func refreshNearby() {
+        guard let loc = userLocation, !allStops.isEmpty else { return }
+        let currentStops = self.allStops
+        let rad = self.searchRadius
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            let nearby = currentStops.compactMap { stop -> Arret? in
+                let stopLoc = CLLocation(latitude: stop.latitude, longitude: stop.longitude)
+                let dist = loc.distance(from: stopLoc)
+                if dist <= rad {
+                    var s = stop
+                    s.distance = "\(Int(dist))m"
+                    return s
+                }
+                return nil
+            }
+            
+            let sorted = nearby.sorted {
+                let d1 = Int($0.distance?.replacingOccurrences(of: "m", with: "") ?? "9999") ?? 9999
+                let d2 = Int($1.distance?.replacingOccurrences(of: "m", with: "") ?? "9999") ?? 9999
+                return d1 < d2
+            }
+            
+            DispatchQueue.main.async {
+                self.nearbyStops = sorted
+            }
+        }
+    }
+    
+    // --- TEMPS RÉEL ---
+    func fetchWaitTimes(codeLieu: String) {
+        self.isLoading = true
+        self.waitTimes = []
+        
+        guard let url = URL(string: "https://open.tan.fr/ewp/tempsattente.json/\(codeLieu)") else { return }
+        
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            DispatchQueue.main.async { self.isLoading = false }
+            guard let data = data else { return }
+            
+            do {
+                let decoded = try JSONDecoder().decode([TempsAttente].self, from: data)
+                DispatchQueue.main.async { self.waitTimes = decoded }
+            } catch { }
+        }.resume()
+    }
+    
+    func generateScheduleFromRealTime(line: LignePassage) {
+        var schedules: [HorairePassage] = []
+        let now = Date()
+        let formatter = DateFormatter(); formatter.dateFormat = "HH:mm"
+        
+        let realPassages = self.waitTimes.filter {
+            $0.ligne?.numLigne == line.numLigne && $0.terminus == line.terminus
+        }
+        
+        var lastDate = now
+        
+        for passage in realPassages {
+            var date: Date?
+            if passage.temps == "Proche" { date = now }
+            else if let min = Int(passage.temps.replacingOccurrences(of: "mn", with: "")) {
+                date = now.addingTimeInterval(TimeInterval(min * 60))
+            }
+            if let d = date {
+                lastDate = d
+                schedules.append(HorairePassage(heure: formatter.string(from: d), isRealTime: true, isPast: false))
+            }
+        }
+        
+        if !schedules.isEmpty {
+            let interval = (["1","2","3","4","5","C1","C2","C3","C6"].contains(line.numLigne)) ? 10.0 * 60 : 20.0 * 60
+            for i in 1...15 {
+                let nextDate = lastDate.addingTimeInterval(Double(i) * interval)
+                let hour = Calendar.current.component(.hour, from: nextDate)
+                if hour >= 1 && hour < 4 { break }
+                schedules.append(HorairePassage(heure: formatter.string(from: nextDate), isRealTime: false, isPast: false))
+            }
+        }
+        self.lineSchedule = schedules
+    }
+    
+    // --- TRAFIC ---
+    func fetchTraffic() {
+        guard let url = URL(string: "https://data.nantesmetropole.fr/api/explore/v2.1/catalog/datasets/244400404_info-trafic-tan-temps-reel/records?limit=50") else { return }
+        
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let data = data else { return }
+            do {
+                let response = try JSONDecoder().decode(TrafficResponseV2.self, from: data)
+                let infos = response.results.compactMap { r -> TrafficInfo? in
+                    let title = r.intitule ?? r.libelle ?? "Info Réseau"
+                    let msg = [r.resume, r.description, r.nature, r.type].compactMap { $0 }.first ?? "Voir site TAN."
+                    return TrafficInfo(titre: title, message: msg, ligne: r.ligne?.first?.num_ligne)
+                }
+                DispatchQueue.main.async { self.trafficInfos = infos }
+            } catch { }
+        }.resume()
+    }
+    
+    // --- IA ---
+    func askGemini(prompt: String, context: String, completion: @escaping (String) -> Void) {
+        guard !GEMINI_API_KEY.isEmpty else { completion("Clé manquante"); return }
+        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=\(GEMINI_API_KEY)")!
+        var req = URLRequest(url: url); req.httpMethod = "POST"; req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = ["contents": [["parts": [["text": prompt]]]], "systemInstruction": ["parts": [["text": context]]]]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        
+        URLSession.shared.dataTask(with: req) { d, _, _ in
+            guard let d=d, let j=try? JSONSerialization.jsonObject(with: d) as? [String:Any],
+                  let c = j["candidates"] as? [[String:Any]], let p = c.first?["content"] as? [String:Any],
+                  let t = (p["parts"] as? [[String:Any]])?.first?["text"] as? String else { completion("Err IA"); return }
+            DispatchQueue.main.async { completion(t) }
+        }.resume()
+    }
+}
+
+// ============================================================================
+// MARK: - 4. VUES UI (Design Liquid Glass)
+// ============================================================================
+
+struct ContentView: View {
+    @StateObject var manager = TransportManager()
+    
+    init() {
+        let appearance = UITabBarAppearance()
+        appearance.configureWithTransparentBackground()
+        appearance.backgroundEffect = UIBlurEffect(style: .systemUltraThinMaterialDark)
+        UITabBar.appearance().standardAppearance = appearance
+        UITabBar.appearance().scrollEdgeAppearance = appearance
+    }
+    
+    var body: some View {
+        ZStack {
+            LiquidBackground()
+            
+            TabView {
+                HomeView(manager: manager)
+                    .tabItem { Label("Horaires", systemImage: "clock.fill") }
+                TrafficView(manager: manager)
+                    .tabItem { Label("Trafic", systemImage: "exclamationmark.triangle.fill") }
+                NaoBotView(manager: manager)
+                    .tabItem { Label("NaoBot", systemImage: "sparkles") }
+            }
+            .accentColor(.tanGreen)
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+struct HomeView: View {
+    @ObservedObject var manager: TransportManager
+    @State private var searchText = ""
+    
+    var listSource: [Arret] {
+        if searchText.isEmpty { return manager.nearbyStops }
+        return manager.allStops.filter { $0.libelle.localizedCaseInsensitiveContains(searchText) }
+    }
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                // Header Glass
+                VStack(alignment: .leading, spacing: 15) {
+                    HStack {
+                        Text("NaoApp").font(.system(size: 36, weight: .bold, design: .rounded)).foregroundColor(.white)
+                        Spacer()
+                        if !manager.databaseLoaded { ProgressView().tint(.white) }
+                        else {
+                            HStack(spacing: 6) {
+                                Image(systemName: manager.userLocation != nil ? "location.fill" : "location.slash")
+                                Text(manager.locationStatus)
+                            }
+                            .font(.caption2).padding(8).background(Color.white.opacity(0.1)).cornerRadius(20)
+                        }
+                    }
+                    
+                    HStack {
+                        Image(systemName: "magnifyingglass").foregroundColor(.white.opacity(0.6))
+                        TextField("Rechercher...", text: $searchText).foregroundColor(.white)
+                    }
+                    .padding(15)
+                    .background(Color.white.opacity(0.1))
+                    .cornerRadius(20)
+                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+                }
+                .padding(20)
+                .padding(.top, 20)
+                .background(.ultraThinMaterial) // Fix pour le fond du header
+                
+                // Liste
+                ScrollView {
+                    LazyVStack(spacing: 15) {
+                        HStack {
+                            Text(searchText.isEmpty ? "AUTOUR DE MOI" : "RÉSULTATS")
+                                .font(.caption).fontWeight(.bold).foregroundColor(.white.opacity(0.7))
+                            Spacer()
+                            if searchText.isEmpty && manager.databaseLoaded {
+                                Button(action: { withAnimation { manager.toggleRadius() } }) {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: manager.searchRadius > 400 ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                                        Text(manager.searchRadius > 400 ? "Réduire" : "Élargir")
+                                    }
+                                    .font(.caption).fontWeight(.bold)
+                                    .padding(8)
+                                    .background(Color.tanGreen.opacity(0.2))
+                                    .foregroundColor(.tanGreen)
+                                    .cornerRadius(15)
+                                }
+                            }
+                        }
+                        .padding(.horizontal).padding(.top, 10)
+                        
+                        ForEach(listSource.prefix(50)) { stop in
+                            NavigationLink(destination: StopDetailView(stop: stop, manager: manager)) {
+                                HStack {
+                                    ZStack {
+                                        Circle().fill(Color.white.opacity(0.1)).frame(width: 48, height: 48)
+                                        Image(systemName: "bus.fill").foregroundColor(.tanGreen)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(stop.libelle).font(.headline).foregroundColor(.white)
+                                        if let dist = stop.distance {
+                                            Text(dist).font(.caption).fontWeight(.bold).foregroundColor(.gray)
+                                        }
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right").foregroundColor(.white.opacity(0.3))
+                                }
+                                .modifier(LiquidCapsuleStyle())
+                            }
+                        }
+                        
+                        if listSource.isEmpty && manager.databaseLoaded {
+                            Text("Aucun arrêt.").foregroundColor(.gray).padding(.top, 40)
+                        }
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 80)
+                }
+            }
+            .navigationBarHidden(true)
+            .background(Color.clear)
+        }
+    }
+}
+
+struct StopDetailView: View {
+    let stop: Arret
+    @ObservedObject var manager: TransportManager
+    
+    var groupedLines: [LignePassage] {
+        var groups = [String: LignePassage]()
+        for t in manager.waitTimes {
+            guard let num = t.ligne?.numLigne else { continue }
+            let key = "\(num)-\(t.terminus)"
+            if groups[key] == nil {
+                groups[key] = LignePassage(numLigne: num, terminus: t.terminus, tempsAffiche: t.temps, sens: t.sens, isRealTime: t.isRealTime)
+            }
+        }
+        return Array(groups.values).sorted { $0.numLigne < $1.numLigne }
+    }
+    
+    var body: some View {
+        ZStack {
+            LiquidBackground().ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 20) {
+                    HStack {
+                        Text(stop.libelle).font(.system(size: 34, weight: .heavy, design: .rounded)).foregroundColor(.white)
+                        Spacer()
+                    }.padding(.horizontal).padding(.top, 20)
+                    
+                    if manager.isLoading {
+                        ProgressView().tint(.white).scaleEffect(1.5).padding(.top, 50)
+                    } else if manager.waitTimes.isEmpty {
+                        VStack(spacing: 15) {
+                            Image(systemName: "moon.stars.fill").font(.system(size: 50)).foregroundColor(.white.opacity(0.3))
+                            Text("Service Terminé").font(.title3).bold().foregroundColor(.white.opacity(0.5))
+                        }.padding(40).modifier(LiquidCapsuleStyle())
+                    } else {
+                        ForEach(groupedLines) { line in
+                            NavigationLink(destination: FullScheduleView(line: line, manager: manager)) {
+                                HStack(spacing: 15) {
+                                    LineBadge(num: line.numLigne)
+                                    VStack(alignment: .leading) {
+                                        Text("Vers \(line.terminus)").font(.headline).foregroundColor(.white)
+                                        if line.isRealTime { Text("Temps réel").font(.caption2).foregroundColor(.green) }
+                                    }
+                                    Spacer()
+                                    Text(line.tempsAffiche).font(.title2).bold()
+                                        .foregroundColor(line.tempsAffiche == "Proche" ? .tanGreen : .white)
+                                }.modifier(LiquidCapsuleStyle())
+                            }
+                        }
+                    }
+                }.padding(.bottom, 80).padding(.horizontal)
+            }
+        }.onAppear { manager.fetchWaitTimes(codeLieu: stop.codeLieu) }
+    }
+}
+
+struct FullScheduleView: View {
+    let line: LignePassage
+    @ObservedObject var manager: TransportManager
+    
+    var body: some View {
+        ZStack {
+            LiquidBackground().ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading) {
+                        Text("Ligne \(line.numLigne)").font(.largeTitle).bold().foregroundColor(.tanGreen)
+                        Text("Vers \(line.terminus)").font(.title3).foregroundColor(.gray)
+                    }.padding(.horizontal).padding(.top, 20)
+                    
+                    LazyVStack(spacing: 12) {
+                        ForEach(manager.lineSchedule) { horaire in
+                            HStack {
+                                Text(horaire.heure).font(.title2).bold().foregroundColor(.white)
+                                Spacer()
+                                if horaire.isRealTime {
+                                    Text("LIVE").font(.caption).bold().padding(6).background(Color.green.opacity(0.8)).foregroundColor(.black).cornerRadius(8)
+                                } else {
+                                    Text("Théorique").font(.caption).foregroundColor(.gray)
+                                }
+                            }
+                            .padding().background(Color.white.opacity(0.05)).cornerRadius(16).padding(.horizontal)
+                        }
+                    }
+                }
+            }
+        }.onAppear { manager.generateScheduleFromRealTime(line: line) }
+    }
+}
+
+struct TrafficView: View {
+    @ObservedObject var manager: TransportManager
+    @State private var aiSummary: String? = nil
+    @State private var loadingAI = false
+    
+    var body: some View {
+        NavigationView {
+            ZStack {
+                LiquidBackground().ignoresSafeArea()
+                ScrollView {
+                    VStack(spacing: 20) {
+                        Text("Info Trafic").font(.largeTitle).bold().foregroundColor(.white)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(.top, 20)
+                        
+                        Button(action: summarize) {
+                            HStack { Image(systemName: "sparkles"); Text(loadingAI ? "..." : "Résumé IA") }
+                            .fontWeight(.bold).frame(maxWidth: .infinity).padding()
+                            .background(LinearGradient(colors: [.tanGreen, .green], startPoint: .leading, endPoint: .trailing))
+                            .foregroundColor(.white).cornerRadius(16)
+                        }.padding(.horizontal)
+                        
+                        if let s = aiSummary { Text(s).padding().modifier(LiquidCapsuleStyle()).padding(.horizontal) }
+                        
+                        ForEach(manager.trafficInfos) { info in
+                            NavigationLink(destination: TrafficDetailView(info: info)) {
+                                HStack(spacing: 15) {
+                                    if let l = info.ligne { LineBadge(num: l) }
+                                    else { Image(systemName: "exclamationmark.triangle.fill").font(.title2).foregroundColor(.orange) }
+                                    VStack(alignment: .leading) {
+                                        Text(info.titre).font(.headline).foregroundColor(.white).lineLimit(1)
+                                        Text("Toucher pour détails").font(.caption).foregroundColor(.gray)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right").foregroundColor(.white.opacity(0.3))
+                                }.modifier(LiquidCapsuleStyle())
+                            }.padding(.horizontal)
+                        }
+                    }.padding(.bottom, 80)
+                }
+            }.navigationBarHidden(true)
+        }
+    }
+    func summarize() {
+        loadingAI = true
+        let t = manager.trafficInfos.prefix(10).map { "\($0.titre): \($0.message)" }.joined(separator: "\n")
+        manager.askGemini(prompt: "Résumé drôle trafic Nantes: \(t)", context: "Conducteur") { self.aiSummary=$0; self.loadingAI=false }
+    }
+}
+
+struct TrafficDetailView: View {
+    let info: TrafficInfo
+    var body: some View {
+        ZStack {
+            LiquidBackground().ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    if let l = info.ligne { HStack { LineBadge(num: l); Text("Ligne concernée").font(.headline).foregroundColor(.gray) } }
+                    Text(info.titre).font(.largeTitle).bold().foregroundColor(.white)
+                    Text(info.message)
+                        .font(.body)
+                        .foregroundColor(.white)
+                        .lineSpacing(6)
+                        .modifier(LiquidCapsuleStyle())
+                    Spacer()
+                }.padding()
+            }
+        }
+    }
+}
+
+struct NaoBotView: View {
+    @ObservedObject var manager: TransportManager
+    @State private var txt = ""; @State private var msgs = [ChatMessage(text: "Bonjour ! Je suis NaoBot.", isUser: false)]
+    var body: some View {
+        ZStack {
+            LiquidBackground().ignoresSafeArea()
+            VStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 15) {
+                        ForEach(msgs) { m in
+                            HStack {
+                                if m.isUser { Spacer() }
+                                Text(m.text).padding().background(m.isUser ? Color.tanGreen : Color.white.opacity(0.1))
+                                    .foregroundColor(.white).cornerRadius(20)
+                                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+                                if !m.isUser { Spacer() }
+                            }
+                        }
+                    }.padding()
+                }
+                HStack {
+                    TextField("Message...", text: $txt).padding().background(Color.white.opacity(0.1)).cornerRadius(25).foregroundColor(.white)
+                    Button(action: send) { Image(systemName: "arrow.up.circle.fill").font(.system(size: 40)).foregroundColor(.tanGreen) }
+                }.padding()
+            }
+        }
+    }
+    func send() {
+        let q=txt; txt=""; msgs.append(ChatMessage(text: q, isUser: true))
+        manager.askGemini(prompt: q, context: "Assistant TAN") { msgs.append(ChatMessage(text: $0, isUser: false)) }
+    }
+}
+
+struct ChatMessage: Identifiable { let id = UUID(); let text: String; let isUser: Bool }
+
+struct LineBadge: View {
+    let num: String
+    var color: Color {
+        switch num {
+        case "1": return .green; case "2": return .red; case "3": return .blue; case "4","5": return .purple; case let x where x.hasPrefix("C"): return .yellow; default: return .gray
+        }
+    }
+    var body: some View {
+        Text(num).font(.system(size: 16, weight: .heavy)).frame(width: 40, height: 40)
+            .background(color).foregroundColor(num.hasPrefix("C") ? .black : .white).cornerRadius(12).shadow(radius: 3)
+    }
+}
+
