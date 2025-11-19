@@ -1,0 +1,505 @@
+import SwiftUI
+import CoreLocation
+import Combine
+
+// ============================================================================
+// MARK: - 1. CONFIGURATION
+// ============================================================================
+
+let GEMINI_API_KEY = "" // 🔴 COLLEZ VOTRE CLÉ ICI
+
+// ============================================================================
+// MARK: - 2. MODÈLES
+// ============================================================================
+
+struct Arret: Identifiable, Hashable {
+    let id = UUID()
+    let codeLieu: String // ID TAN (ex: "COMM")
+    let libelle: String  // Nom (ex: "Commerce")
+    let latitude: Double
+    let longitude: Double
+    var distance: String? = nil
+    
+    static func == (lhs: Arret, rhs: Arret) -> Bool { lhs.codeLieu == rhs.codeLieu }
+    func hash(into hasher: inout Hasher) { hasher.combine(codeLieu) }
+}
+
+struct TempsAttente: Codable, Identifiable {
+    let id = UUID()
+    let sens: Int
+    let terminus: String
+    let temps: String
+    let ligne: LigneAPI?
+    var isRealTime: Bool { temps == "Proche" || temps.contains("mn") }
+    private enum CodingKeys: String, CodingKey { case sens, terminus, temps, ligne }
+}
+
+struct LigneAPI: Codable { let numLigne: String }
+
+struct TrafficInfo: Identifiable {
+    let id = UUID()
+    let titre: String
+    let message: String
+    let ligne: String?
+}
+
+// Modèles API Trafic V2.1
+struct TrafficResponseV2: Codable { let results: [TrafficRecordV2] }
+struct TrafficRecordV2: Codable {
+    let intitule: String?
+    let resume: String?
+    let description: String?
+    let nature: String?
+    let type: String?
+    let ligne: [TrafficLineV2]?
+}
+struct TrafficLineV2: Codable { let num_ligne: String? }
+
+// ============================================================================
+// MARK: - 3. GESTIONNAIRE DE TRANSPORT
+// ============================================================================
+
+class TransportManager: NSObject, ObservableObject, CLLocationManagerDelegate {
+    @Published var locationStatus: String = "Recherche GPS..."
+    @Published var allStops: [Arret] = []     // Base GTFS complète
+    @Published var nearbyStops: [Arret] = []  // < 1km
+    @Published var waitTimes: [TempsAttente] = []
+    @Published var trafficInfos: [TrafficInfo] = []
+    @Published var userLocation: CLLocation?
+    @Published var isLoading: Bool = false
+    @Published var databaseLoaded: Bool = false
+
+    private let locationManager = CLLocationManager()
+    
+    override init() {
+        super.init()
+        
+        // 1. CHARGEMENT GTFS LOCAL (IMMÉDIAT)
+        loadGTFSData()
+        
+        // 2. GPS
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        locationManager.distanceFilter = 50
+        locationManager.requestWhenInUseAuthorization()
+        locationManager.startUpdatingLocation()
+        
+        // 3. Trafic en tâche de fond
+        Task { await fetchTraffic() }
+    }
+    
+    // --- CHARGEMENT GTFS (FICHIER LOCAL stops.txt) ---
+    func loadGTFSData() {
+        print("📂 Chargement GTFS local...")
+        
+        guard let path = Bundle.main.path(forResource: "stops", ofType: "txt") else {
+            print("❌ Fichier stops.txt introuvable ! Glissez-le dans le projet Xcode.")
+            return
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let content = try String(contentsOfFile: path, encoding: .utf8)
+                let lines = content.components(separatedBy: "\n")
+                
+                var stops = [Arret]()
+                
+                // Format GTFS stops.txt: stop_id,stop_name,...,stop_lat,stop_lon,...
+                // On saute la première ligne (en-tête)
+                for (index, line) in lines.enumerated() {
+                    if index == 0 || line.isEmpty { continue }
+                    
+                    // Parsing CSV simple (attention aux guillemets)
+                    let parts = self.parseCSVLine(line)
+                    
+                    // On vérifie qu'on a assez de colonnes (stop_id=0, stop_name=1, lat=3, lon=4 dans votre fichier standard)
+                    // Note: Adaptez les index si votre fichier est différent.
+                    // Basé sur votre extrait : stop_id,stop_name,desc,lat,lon,...
+                    
+                    if parts.count >= 5,
+                       let lat = Double(parts[3]),
+                       let lon = Double(parts[4]) {
+                        
+                        let id = parts[0].replacingOccurrences(of: "\"", with: "")
+                        let name = parts[1].replacingOccurrences(of: "\"", with: "")
+                        
+                        // On ne garde que les arrêts "parents" (codes courts type "COMM") ou on nettoie
+                        // Votre fichier semble avoir des IDs type "ABCH". C'est parfait.
+                        
+                        stops.append(Arret(codeLieu: id, libelle: name, latitude: lat, longitude: lon))
+                    }
+                }
+                
+                // Tri et mise à jour UI
+                let sorted = stops.sorted { $0.libelle < $1.libelle }
+                
+                DispatchQueue.main.async {
+                    self.allStops = sorted
+                    self.databaseLoaded = true
+                    print("✅ GTFS chargé : \(self.allStops.count) arrêts.")
+                    self.recalculateNearbyStops()
+                }
+                
+            } catch {
+                print("❌ Erreur lecture GTFS: \(error)")
+            }
+        }
+    }
+    
+    // Helper pour parser le CSV proprement (gère les virgules dans les guillemets)
+    private func parseCSVLine(_ line: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var insideQuotes = false
+        
+        for char in line {
+            if char == "\"" {
+                insideQuotes.toggle()
+            } else if char == "," && !insideQuotes {
+                result.append(current)
+                current = ""
+            } else {
+                current.append(char)
+            }
+        }
+        result.append(current)
+        return result
+    }
+    
+    // --- GÉOLOCALISATION ---
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let location = locations.last else { return }
+        self.userLocation = location
+        self.locationStatus = "GPS Actif"
+        self.recalculateNearbyStops()
+    }
+    
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("⚠️ GPS: \(error.localizedDescription)")
+        self.locationStatus = "GPS Inactif"
+    }
+    
+    // --- FILTRE 1KM ---
+    func recalculateNearbyStops() {
+        guard let userLoc = self.userLocation, !self.allStops.isEmpty else { return }
+        
+        DispatchQueue.global(qos: .userInteractive).async {
+            // On filtre d'abord grossièrement par coordonnées pour aller vite
+            // 1 degré latitude ~= 111km. 1km ~= 0.009 degré.
+            let latMin = userLoc.coordinate.latitude - 0.02
+            let latMax = userLoc.coordinate.latitude + 0.02
+            let lonMin = userLoc.coordinate.longitude - 0.02
+            let lonMax = userLoc.coordinate.longitude + 0.02
+            
+            let candidates = self.allStops.filter {
+                $0.latitude >= latMin && $0.latitude <= latMax &&
+                $0.longitude >= lonMin && $0.longitude <= lonMax
+            }
+            
+            // Calcul précis
+            let nearby = candidates.compactMap { stop -> Arret? in
+                let stopLoc = CLLocation(latitude: stop.latitude, longitude: stop.longitude)
+                let dist = userLoc.distance(from: stopLoc)
+                if dist <= 1000 {
+                    var newStop = stop
+                    newStop.distance = "\(Int(dist))m"
+                    return newStop
+                }
+                return nil
+            }
+            
+            let sorted = nearby.sorted {
+                let d1 = Int($0.distance?.replacingOccurrences(of: "m", with: "") ?? "9999") ?? 9999
+                let d2 = Int($1.distance?.replacingOccurrences(of: "m", with: "") ?? "9999") ?? 9999
+                return d1 < d2
+            }
+            
+            DispatchQueue.main.async { self.nearbyStops = sorted }
+        }
+    }
+    
+    // --- TEMPS RÉEL (API TAN) ---
+    func fetchWaitTimes(codeLieu: String) async {
+        self.isLoading = true
+        self.waitTimes = []
+        
+        // L'API temps réel demande le codeLieu. Dans le GTFS c'est souvent le stop_id.
+        // Si l'API ne répond pas avec l'ID du GTFS, il faudra peut-être mapper.
+        // Essai direct :
+        guard let url = URL(string: "https://open.tan.fr/ewp/tempsattente.json/\(codeLieu)") else { return }
+        
+        print("🔎 TR pour \(codeLieu)")
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let decoded = try JSONDecoder().decode([TempsAttente].self, from: data)
+            self.waitTimes = decoded
+            self.isLoading = false
+        } catch {
+            print("⚠️ Erreur TR: \(error)")
+            self.isLoading = false
+        }
+    }
+    
+    // --- TRAFIC ---
+    func fetchTraffic() async {
+        guard let url = URL(string: "https://data.nantesmetropole.fr/api/explore/v2.1/catalog/datasets/244400404_info-trafic-tan-temps-reel/records?limit=50") else { return }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let response = try JSONDecoder().decode(TrafficResponseV2.self, from: data)
+            
+            let infos = response.results.compactMap { r -> TrafficInfo? in
+                let title = r.intitule ?? r.resume ?? r.nature ?? r.type ?? "Info Réseau"
+                let msg = [r.resume, r.description, r.nature, r.type].compactMap { $0 }.first ?? "Détails non disponibles."
+                return TrafficInfo(titre: title, message: msg, ligne: r.ligne?.first?.num_ligne)
+            }
+            self.trafficInfos = infos
+        } catch { print("❌ Trafic: \(error)") }
+    }
+    
+    // --- IA ---
+    func askGemini(prompt: String, context: String, completion: @escaping (String) -> Void) {
+        guard !GEMINI_API_KEY.isEmpty else { completion("Clé manquante"); return }
+        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=\(GEMINI_API_KEY)")!
+        var req = URLRequest(url: url); req.httpMethod = "POST"; req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = ["contents": [["parts": [["text": prompt]]]], "systemInstruction": ["parts": [["text": context]]]]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        
+        URLSession.shared.dataTask(with: req) { d, _, _ in
+            guard let d=d, let j=try? JSONSerialization.jsonObject(with: d) as? [String:Any],
+                  let c = j["candidates"] as? [[String:Any]], let p = c.first?["content"] as? [String:Any],
+                  let t = (p["parts"] as? [[String:Any]])?.first?["text"] as? String else { completion("Err IA"); return }
+            DispatchQueue.main.async { completion(t) }
+        }.resume()
+    }
+}
+
+// ============================================================================
+// MARK: - 4. VUES UI
+// ============================================================================
+
+struct ContentView: View {
+    @StateObject var manager = TransportManager()
+    @State private var selection = 0
+    
+    init() { UITabBar.appearance().backgroundColor = UIColor.systemBackground }
+    
+    var body: some View {
+        TabView(selection: $selection) {
+            HomeView(manager: manager).tabItem { Label("Horaires", systemImage: "clock.fill") }.tag(0)
+            TrafficView(manager: manager).tabItem { Label("Trafic", systemImage: "exclamationmark.triangle.fill") }.tag(1)
+            NaoBotView(manager: manager).tabItem { Label("NaoBot", systemImage: "message.fill") }.tag(2)
+        }
+        .accentColor(Color(hex: "009640"))
+    }
+}
+
+struct HomeView: View {
+    @ObservedObject var manager: TransportManager
+    @State private var searchText = ""
+    
+    var listSource: [Arret] {
+        if searchText.isEmpty {
+            return manager.nearbyStops.isEmpty ? manager.allStops : manager.nearbyStops
+        }
+        return manager.allStops.filter { $0.libelle.localizedCaseInsensitiveContains(searchText) }
+    }
+    
+    var body: some View {
+        NavigationView {
+            ZStack {
+                Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
+                VStack(spacing: 0) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Transport").font(.system(size: 34, weight: .bold))
+                            Spacer()
+                            if !manager.databaseLoaded {
+                                HStack { ProgressView(); Text("Chargement GTFS...").font(.caption) }
+                            }
+                        }
+                        HStack {
+                            Image(systemName: "magnifyingglass").foregroundColor(.gray)
+                            TextField("Rechercher parmi \(manager.allStops.count) arrêts...", text: $searchText)
+                        }
+                        .padding(12).background(Color.white).cornerRadius(12)
+                    }.padding().background(.ultraThinMaterial)
+                    
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            HStack {
+                                Text(searchText.isEmpty ? (manager.nearbyStops.isEmpty ? "LISTE COMPLÈTE" : "AUTOUR DE MOI (< 1KM)") : "RÉSULTATS")
+                                    .font(.caption).fontWeight(.bold).foregroundColor(.gray)
+                                Spacer()
+                                Text("\(listSource.count) arrêts").font(.caption).foregroundColor(.gray)
+                            }
+                            .padding(.horizontal).padding(.top, 10)
+                            
+                            ForEach(listSource.prefix(50)) { stop in
+                                NavigationLink(destination: StopDetailView(stop: stop, manager: manager)) {
+                                    StopRow(stop: stop)
+                                }.buttonStyle(PlainButtonStyle())
+                            }
+                        }.padding(.horizontal).padding(.bottom, 20)
+                    }
+                }
+            }.navigationBarHidden(true)
+        }
+    }
+}
+
+struct StopRow: View {
+    let stop: Arret
+    var body: some View {
+        HStack {
+            ZStack {
+                Circle().fill(Color.white).frame(width: 44, height: 44).shadow(radius: 1)
+                Image(systemName: "bus.fill").foregroundColor(Color(hex: "009640"))
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stop.libelle).font(.headline).foregroundColor(.primary)
+                if let dist = stop.distance {
+                    Text(dist).font(.caption).fontWeight(.bold).foregroundColor(Color(hex: "009640"))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color(hex: "009640").opacity(0.1)).cornerRadius(4)
+                }
+            }
+            Spacer()
+            Image(systemName: "chevron.right").foregroundColor(.gray)
+        }
+        .padding().background(Color.white).cornerRadius(16).shadow(radius: 1, y: 1)
+    }
+}
+
+struct StopDetailView: View {
+    let stop: Arret
+    @ObservedObject var manager: TransportManager
+    
+    var body: some View {
+        ZStack {
+            Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
+            List {
+                Section(header: Text("TEMPS RÉEL")) {
+                    if manager.isLoading { HStack { Spacer(); ProgressView(); Spacer() } }
+                    else if manager.waitTimes.isEmpty { Text("Aucun passage immédiat.").foregroundColor(.gray) }
+                    else {
+                        ForEach(manager.waitTimes) { time in
+                            HStack {
+                                LineBadge(num: time.ligne?.numLigne ?? "?")
+                                VStack(alignment: .leading) {
+                                    Text(time.terminus).font(.headline)
+                                    Text("Sens \(time.sens)").font(.caption).foregroundColor(.gray)
+                                }
+                                Spacer()
+                                VStack(alignment: .trailing) {
+                                    Text(time.temps).font(.title3).bold()
+                                        .foregroundColor(time.isRealTime ? Color(hex: "009640") : .primary)
+                                    if time.isRealTime {
+                                        Image(systemName: "dot.radiowaves.left.and.right")
+                                            .font(.caption2).foregroundColor(Color(hex: "009640"))
+                                    }
+                                }
+                            }.padding(.vertical, 4)
+                        }
+                    }
+                }
+            }.listStyle(InsetGroupedListStyle())
+        }
+        .navigationTitle(stop.libelle)
+        .onAppear {
+            Task { await manager.fetchWaitTimes(codeLieu: stop.codeLieu) }
+        }
+    }
+}
+
+struct TrafficView: View {
+    @ObservedObject var manager: TransportManager
+    @State private var aiSummary: String? = nil
+    @State private var loadingAI = false
+    
+    var body: some View {
+        NavigationView {
+            List {
+                Section {
+                    Button(action: summarize) {
+                        HStack { Image(systemName: "sparkles"); Text(loadingAI ? "..." : "Résumé IA") }
+                        .frame(maxWidth: .infinity).padding().background(Color.green).foregroundColor(.white).cornerRadius(12)
+                    }.listRowBackground(Color.clear).listRowInsets(EdgeInsets())
+                    if let s = aiSummary { Text(s).padding().background(Color.green.opacity(0.1)).cornerRadius(8) }
+                }
+                Section(header: Text("PERTURBATIONS")) {
+                    ForEach(manager.trafficInfos) { info in
+                        VStack(alignment: .leading) {
+                            HStack {
+                                if let l = info.ligne { LineBadge(num: l) }
+                                Text(info.titre).font(.headline)
+                            }
+                            Text(info.message).font(.caption).foregroundColor(.secondary)
+                        }.padding(.vertical, 4)
+                    }
+                }
+            }.navigationTitle("Info Trafic")
+        }
+    }
+    func summarize() {
+        loadingAI = true
+        let t = manager.trafficInfos.prefix(10).map { "\($0.titre): \($0.message)" }.joined(separator: "\n")
+        manager.askGemini(prompt: "Résumé drôle trafic Nantes: \(t)", context: "Conducteur") { self.aiSummary=$0; self.loadingAI=false }
+    }
+}
+
+struct NaoBotView: View {
+    @ObservedObject var manager: TransportManager
+    @State private var txt = ""; @State private var msgs = [ChatMessage(text: "Salut !", isUser: false)]
+    var body: some View {
+        VStack {
+            ScrollView {
+                VStack(alignment: .leading) {
+                    ForEach(msgs) { m in
+                        HStack {
+                            if m.isUser { Spacer() }
+                            Text(m.text).padding().background(m.isUser ? Color(hex: "009640") : Color(uiColor: .secondarySystemBackground))
+                                .foregroundColor(m.isUser ? .white : .primary).cornerRadius(16)
+                            if !m.isUser { Spacer() }
+                        }
+                    }
+                }.padding()
+            }
+            HStack {
+                TextField("Message...", text: $txt).textFieldStyle(RoundedBorderTextFieldStyle())
+                Button(action: send) { Image(systemName: "paperplane.fill").foregroundColor(Color(hex: "009640")) }
+            }.padding()
+        }
+    }
+    func send() {
+        let q=txt; txt=""; msgs.append(ChatMessage(text: q, isUser: true))
+        manager.askGemini(prompt: q, context: "Assistant TAN") { msgs.append(ChatMessage(text: $0, isUser: false)) }
+    }
+}
+
+struct ChatMessage: Identifiable { let id = UUID(); let text: String; let isUser: Bool }
+
+struct LineBadge: View {
+    let num: String
+    var color: Color {
+        switch num {
+        case "1": return Color(hex: "009640"); case "2": return Color(hex: "E30613"); case "3": return Color(hex: "2D2F92")
+        case "4", "5": return Color(hex: "7A2182"); case let x where x.hasPrefix("C"): return Color(hex: "FFCC00")
+        default: return .gray
+        }
+    }
+    var body: some View {
+        Text(num).font(.system(size: 14, weight: .bold)).frame(width: 32, height: 32)
+            .background(color).foregroundColor(num.hasPrefix("C") ? .black : .white).cornerRadius(8)
+    }
+}
+
+extension Color {
+    init(hex: String) {
+        let scanner = Scanner(string: hex); var rgbValue: UInt64 = 0; scanner.scanHexInt64(&rgbValue)
+        let r = (rgbValue & 0xff0000) >> 16; let g = (rgbValue & 0xff00) >> 8; let b = rgbValue & 0xff
+        self.init(red: Double(r) / 0xff, green: Double(g) / 0xff, blue: Double(b) / 0xff)
+    }
+}
+
